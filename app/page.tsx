@@ -36,9 +36,16 @@ export default function Page() {
 
         // 1. 获取充电站列表
         console.log('获取充电站列表...')
-        const stationsResponse = await getStations({ page: 0, size: 50 })
-        const stationsData = stationsResponse.data.content
-        setStations(stationsData)
+        console.log('API Base URL:', process.env.NEXT_PUBLIC_API_BASE_URL)
+        try {
+          const stationsResponse = await getStations({ page: 0, size: 50 })
+          console.log('API响应:', stationsResponse)
+          const stationsData = stationsResponse.data.content
+          setStations(stationsData)
+        } catch (error) {
+          console.error('获取充电站列表失败:', error)
+          throw error
+        }
 
         // 2. 获取每个充电站的充电桩信息
         console.log('获取充电桩信息...')

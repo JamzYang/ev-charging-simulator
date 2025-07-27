@@ -198,7 +198,7 @@ cp .env.example .env.local
 2. **配置环境变量**
 ```bash
 # 充电站 API 服务地址
-NEXT_PUBLIC_API_BASE_URL=http://localhost:8080/api/v1
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8083/api/v1
 
 # WebSocket 网关地址
 NEXT_PUBLIC_WEBSOCKET_URL=ws://localhost:8080/ocpp
@@ -377,7 +377,7 @@ npm run lint
 
 #### 开发环境
 ```bash
-NEXT_PUBLIC_API_BASE_URL=http://localhost:8080/api/v1
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8083/api/v1
 NEXT_PUBLIC_WEBSOCKET_URL=ws://localhost:8080/ocpp
 ```
 

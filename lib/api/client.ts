@@ -1,6 +1,6 @@
 import { ApiResponse, ApiError, HttpStatusCode } from "@/types/api"
 
-const BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8080/api/v1'
+const BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8083/api/v1'
 const DEFAULT_TIMEOUT = 10000 // 10秒超时
 const MAX_RETRY_ATTEMPTS = 3
 const RETRY_DELAY = 1000 // 1秒重试延迟
@@ -31,11 +31,23 @@ class ApiClient {
       ...config.headers,
     }
 
-    // 添加时间戳防止缓存
-    if (config.method === 'GET') {
-      const url = new URL(config.url || '', this.baseUrl)
-      url.searchParams.set('_t', Date.now().toString())
-      config.url = url.toString()
+    // 添加时间戳防止缓存（仅对GET请求）
+    if (config.method === 'GET' && config.url) {
+      try {
+        // 检查是否是完整URL
+        if (config.url.startsWith('http')) {
+          const url = new URL(config.url)
+          url.searchParams.set('_t', Date.now().toString())
+          config.url = url.toString()
+        } else {
+          // 相对路径，手动添加时间戳参数
+          const separator = config.url.includes('?') ? '&' : '?'
+          config.url = `${config.url}${separator}_t=${Date.now()}`
+        }
+      } catch (error) {
+        console.warn('添加时间戳失败:', error)
+        // 如果URL处理失败，继续使用原URL
+      }
     }
 
     return {
@@ -48,15 +60,28 @@ class ApiClient {
   // 响应拦截器
   private async responseInterceptor<T>(response: Response): Promise<ApiResponse<T>> {
     const contentType = response.headers.get('content-type')
-    
+    console.log('📋 响应Content-Type:', contentType)
+
     let data: any
-    if (contentType && contentType.includes('application/json')) {
-      data = await response.json()
-    } else {
-      data = await response.text()
+    try {
+      if (contentType && contentType.includes('application/json')) {
+        data = await response.json()
+        console.log('📄 JSON响应数据:', data)
+      } else {
+        data = await response.text()
+        console.log('📄 文本响应数据:', data)
+      }
+    } catch (parseError) {
+      console.error('❌ 响应解析失败:', parseError)
+      throw new Error('响应数据解析失败')
     }
 
     if (!response.ok) {
+      console.error('❌ HTTP错误响应:', {
+        status: response.status,
+        statusText: response.statusText,
+        data
+      })
       const error: ApiError = {
         code: response.status.toString(),
         message: data.message || response.statusText,
@@ -68,10 +93,12 @@ class ApiClient {
 
     // 如果响应已经是ApiResponse格式，直接返回
     if (data && typeof data === 'object' && 'success' in data) {
+      console.log('✅ 标准ApiResponse格式')
       return data as ApiResponse<T>
     }
 
     // 否则包装成ApiResponse格式
+    console.log('🔄 包装为ApiResponse格式')
     return {
       success: true,
       message: 'Success',
@@ -143,7 +170,15 @@ class ApiClient {
     config: RequestConfig = {}
   ): Promise<ApiResponse<T>> {
     const url = endpoint.startsWith('http') ? endpoint : `${this.baseUrl}${endpoint}`
-    
+
+    // 添加调试日志
+    console.log('🚀 API请求:', {
+      url,
+      method: config.method || 'GET',
+      headers: this.defaultHeaders,
+      baseUrl: this.baseUrl
+    })
+
     return this.retryRequest(async () => {
       const requestConfig = await this.requestInterceptor({
         ...config,
@@ -160,9 +195,20 @@ class ApiClient {
         })
 
         clearTimeout(timeoutId)
+
+        // 添加响应调试日志
+        console.log('📥 API响应:', {
+          url,
+          status: response.status,
+          statusText: response.statusText,
+          headers: Object.fromEntries(response.headers.entries()),
+          ok: response.ok
+        })
+
         return await this.responseInterceptor<T>(response)
       } catch (error) {
         clearTimeout(timeoutId)
+        console.error('❌ API请求失败:', { url, error })
         return this.handleError(error)
       }
     }, config.retries, config.retryDelay)

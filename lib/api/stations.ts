@@ -20,7 +20,7 @@ export async function getStations(params: StationQueryParams = {}): Promise<ApiR
     direction: params.direction || 'DESC',
     ...params
   }
-  return apiClient.get('/stations', queryParams)
+  return apiClient.get('/stations/list', queryParams)
 }
 
 // 搜索附近充电站

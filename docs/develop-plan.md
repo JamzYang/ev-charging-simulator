@@ -364,7 +364,7 @@
 ### 环境变量配置
 ````bash path=.env.local mode=EDIT
 # Station API配置
-NEXT_PUBLIC_API_BASE_URL=http://localhost:8080/api/v1
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8083/api/v1
 
 # WebSocket网关配置
 NEXT_PUBLIC_WEBSOCKET_URL=ws://localhost:8080/ocpp

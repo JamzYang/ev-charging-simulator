@@ -50,7 +50,7 @@
 ### 1.1 服务概述
 
 **服务名称**: 充电站域服务 (Charge Station Service)  
-**基础URL**: `http://localhost:8080/api/v1`  
+**基础URL**: `http://localhost:8083/api/v1`  
 **API版本**: v1  
 **响应格式**: JSON  
 **字符编码**: UTF-8
@@ -703,8 +703,8 @@ PUT /api/v1/charge-points/CP001/status?status=Available
 ### 8.1 开发环境
 
 **服务配置**:
-- **服务地址**: `http://localhost:8080/api/v1`
-- **服务端口**: 8080
+- **服务地址**: `http://localhost:8083/api/v1`
+- **服务端口**: 8083
 - **上下文路径**: `/api/v1`
 
 **依赖服务**:
@@ -713,12 +713,12 @@ PUT /api/v1/charge-points/CP001/status?status=Available
 - **消息队列**: Kafka (localhost:9092)
 
 **API文档**:
-- **Swagger UI**: `http://localhost:8080/swagger-ui.html`
+- **Swagger UI**: `http://localhost:8083/swagger-ui.html`
 
 ### 8.2 测试环境
 
 **服务配置**:
-- **服务地址**: `http://test-env:8080/api/v1`
+- **服务地址**: `http://test-env:8083/api/v1`
 - **数据库**: PostgreSQL (test-db:5432/charge_station_test)
 - **缓存**: Redis (test-redis:6379)
 - **消息队列**: Kafka (test-kafka:9092)
