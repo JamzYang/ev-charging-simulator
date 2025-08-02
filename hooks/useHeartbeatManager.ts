@@ -43,66 +43,107 @@ export function useHeartbeatManager() {
 
       console.log(`获取到 ${allChargePoints.length} 个充电桩`)
 
-      // 3. 为每个充电桩建立连接
-      const connectionPromises = allChargePoints.map(async (chargePoint, index) => {
+      // 3. 去重充电桩ID
+      const uniqueChargePoints = Array.from(
+        new Map(allChargePoints.map(cp => [cp.chargePointId, cp])).values()
+      )
+
+      if (uniqueChargePoints.length !== allChargePoints.length) {
+        console.warn(`发现重复充电桩ID，去重后: ${uniqueChargePoints.length}/${allChargePoints.length}`)
+      }
+
+      // 4. 串行建立连接（避免并发竞争）
+      let successCount = 0
+      let networkErrors = 0
+      let timeoutErrors = 0
+      let duplicateErrors = 0
+      let otherErrors = 0
+
+      for (let i = 0; i < uniqueChargePoints.length; i++) {
+        const chargePoint = uniqueChargePoints[i]
+
         try {
+          // 设置错误处理器
+          ocppWebSocketManager.onError(chargePoint.chargePointId, (error) => {
+            console.error(`充电桩 ${chargePoint.chargePointId} 错误:`, error)
+
+            // 错误分类统计
+            if (error.message.includes('网络') || error.message.includes('offline')) {
+              networkErrors++
+            } else if (error.message.includes('超时') || error.message.includes('timeout')) {
+              timeoutErrors++
+            } else if (error.message.includes('already exists') || error.message.includes('重复')) {
+              duplicateErrors++
+            } else {
+              otherErrors++
+            }
+          })
+
+          // 建立连接
           await ocppWebSocketManager.connect(chargePoint.chargePointId)
-          
+
           // 发送初始状态通知
           await ocppWebSocketManager.sendStatusNotification(
-            chargePoint.chargePointId, 
-            1, 
+            chargePoint.chargePointId,
+            1,
             'Available'
           )
-          
+
+          successCount++
+
           // 更新进度
-          setInitializationProgress(50 + ((index + 1) / allChargePoints.length) * 50)
-          
-          return chargePoint.chargePointId
+          setInitializationProgress(50 + ((i + 1) / uniqueChargePoints.length) * 50)
+
+          // 短暂延迟，避免过快的连接请求
+          if (i < uniqueChargePoints.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 100))
+          }
+
         } catch (error) {
           console.error(`连接充电桩 ${chargePoint.chargePointId} 失败:`, error)
-          return null
+
+          // 错误分类
+          const errorMessage = (error as Error).message
+          if (errorMessage.includes('网络') || errorMessage.includes('offline')) {
+            networkErrors++
+          } else if (errorMessage.includes('超时') || errorMessage.includes('timeout')) {
+            timeoutErrors++
+          } else if (errorMessage.includes('already exists') || errorMessage.includes('重复')) {
+            duplicateErrors++
+          } else {
+            otherErrors++
+          }
         }
-      })
+      }
 
-      const results = await Promise.allSettled(connectionPromises)
-      const successCount = results.filter(result =>
-        result.status === 'fulfilled' && result.value !== null
-      ).length
-
-      const failedResults = results.filter(result => result.status === 'rejected') as PromiseRejectedResult[]
-
-      console.log(`成功连接 ${successCount}/${allChargePoints.length} 个充电桩`)
-
-      // 分析失败原因
-      const networkErrors = failedResults.filter(r =>
-        r.reason?.message?.includes('网络') || r.reason?.message?.includes('offline')
-      ).length
-
-      const timeoutErrors = failedResults.filter(r =>
-        r.reason?.message?.includes('超时') || r.reason?.message?.includes('timeout')
-      ).length
+      console.log(`连接完成: 成功 ${successCount}/${uniqueChargePoints.length}`)
+      console.log(`错误统计: 网络错误 ${networkErrors}, 超时错误 ${timeoutErrors}, 重复连接 ${duplicateErrors}, 其他错误 ${otherErrors}`)
 
       // 显示详细的成功/失败提示
-      if (successCount === allChargePoints.length) {
+      if (successCount === uniqueChargePoints.length) {
         toast.success(`所有 ${successCount} 个充电桩连接成功`)
       } else if (successCount > 0) {
-        toast.success(`成功连接 ${successCount}/${allChargePoints.length} 个充电桩`)
+        toast.success(`成功连接 ${successCount}/${uniqueChargePoints.length} 个充电桩`)
 
         // 显示失败原因统计
+        if (duplicateErrors > 0) {
+          toast.error(`${duplicateErrors} 个充电桩重复连接被拒绝`)
+        }
         if (networkErrors > 0) {
           toast.error(`${networkErrors} 个充电桩网络连接失败`)
         }
         if (timeoutErrors > 0) {
           toast.error(`${timeoutErrors} 个充电桩连接超时`)
         }
-        if (failedResults.length - networkErrors - timeoutErrors > 0) {
-          toast.error(`${failedResults.length - networkErrors - timeoutErrors} 个充电桩连接失败`)
+        if (otherErrors > 0) {
+          toast.error(`${otherErrors} 个充电桩连接失败`)
         }
       } else {
-        if (networkErrors === failedResults.length) {
+        if (duplicateErrors === uniqueChargePoints.length) {
+          toast.error('所有充电桩连接失败：重复连接被拒绝，请检查是否有其他实例在运行')
+        } else if (networkErrors === uniqueChargePoints.length) {
           toast.error('所有充电桩连接失败：网络连接问题')
-        } else if (timeoutErrors === failedResults.length) {
+        } else if (timeoutErrors === uniqueChargePoints.length) {
           toast.error('所有充电桩连接失败：连接超时')
         } else {
           toast.error('所有充电桩连接失败，请检查网络和服务器状态')
@@ -131,6 +172,8 @@ export function useHeartbeatManager() {
           toast.error(`网络连接问题: ${chargePointId}`)
         } else if (error.message.includes('超时')) {
           toast.error(`连接超时: ${chargePointId}`)
+        } else if (error.message.includes('already exists')) {
+          toast.error(`${chargePointId} 重复连接被拒绝`)
         } else if (error.message.includes('重连次数已达上限')) {
           toast.error(`${chargePointId} 连接失败，请检查网络`)
         }
@@ -148,6 +191,8 @@ export function useHeartbeatManager() {
         toast.error('网络连接不可用，请检查网络设置')
       } else if (errorMessage.includes('连接超时')) {
         toast.error(`充电桩 ${chargePointId} 连接超时，请稍后重试`)
+      } else if (errorMessage.includes('already exists')) {
+        toast.error(`充电桩 ${chargePointId} 重复连接被拒绝，请检查是否有其他实例在运行`)
       } else {
         toast.error(`充电桩 ${chargePointId} 上线失败: ${errorMessage}`)
       }
@@ -156,11 +201,11 @@ export function useHeartbeatManager() {
   }, [updateConnectionStatuses])
 
   // 停止单个充电桩心跳
-  const stopChargerHeartbeat = useCallback((chargePointId: string) => {
+  const stopChargerHeartbeat = useCallback(async (chargePointId: string) => {
     try {
       // 移除错误处理器
       ocppWebSocketManager.offError(chargePointId)
-      ocppWebSocketManager.disconnect(chargePointId)
+      await ocppWebSocketManager.disconnect(chargePointId)
       updateConnectionStatuses()
       toast.success(`充电桩 ${chargePointId} 已离线`)
     } catch (error) {
@@ -188,22 +233,23 @@ export function useHeartbeatManager() {
   }, [startChargerHeartbeat])
 
   // 批量停止充电桩
-  const stopMultipleChargers = useCallback((chargePointIds: string[]) => {
-    chargePointIds.forEach(id => stopChargerHeartbeat(id))
+  const stopMultipleChargers = useCallback(async (chargePointIds: string[]) => {
+    const promises = chargePointIds.map(id => stopChargerHeartbeat(id))
+    await Promise.allSettled(promises)
     toast.success(`已停止 ${chargePointIds.length} 个充电桩`)
   }, [stopChargerHeartbeat])
 
   // 停止所有充电桩
-  const stopAllHeartbeats = useCallback(() => {
+  const stopAllHeartbeats = useCallback(async () => {
     try {
-      ocppWebSocketManager.disconnectAll()
+      await ocppWebSocketManager.disconnectAll()
       updateConnectionStatuses()
       toast.success('所有充电桩已离线')
     } catch (error) {
       console.error('停止所有心跳失败:', error)
       toast.error('停止所有充电桩失败')
     }
-  }, [])
+  }, [updateConnectionStatuses])
 
   // 重连所有充电桩
   const reconnectAllHeartbeats = useCallback(async () => {

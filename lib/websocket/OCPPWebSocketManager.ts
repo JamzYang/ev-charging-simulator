@@ -1,5 +1,5 @@
-import { 
-  OCPPMessage, 
+import {
+  OCPPMessage,
   OCPPAction,
   WebSocketState,
   WebSocketManagerConfig,
@@ -31,6 +31,7 @@ export class OCPPWebSocketManager {
       reconnectInterval: config?.reconnectInterval || 5000, // 5秒
       maxReconnectAttempts: config?.maxReconnectAttempts || 5,
       timeout: config?.timeout || 30000, // 30秒
+      disconnectTimeout: config?.disconnectTimeout || 10000, // 断开连接超时时间
     }
 
     this.state = {
@@ -39,6 +40,7 @@ export class OCPPWebSocketManager {
       heartbeatIntervals: new Map(),
       messageHandlers: new Map(),
       reconnectAttempts: new Map(),
+      connectionLocks: new Map(), // 添加连接操作互斥锁
     }
 
     // 监听网络状态变化
@@ -92,18 +94,55 @@ export class OCPPWebSocketManager {
     }
   }
 
-  // 连接充电桩
+  // 连接充电桩（带互斥锁）
   async connect(chargePointId: string): Promise<boolean> {
+    // 检查是否已有连接操作在进行
+    const existingLock = this.state.connectionLocks.get(chargePointId)
+    if (existingLock) {
+      console.log(`充电桩 ${chargePointId} 连接操作已在进行中，等待完成...`)
+      return existingLock
+    }
+
+    // 创建连接操作锁
+    const connectionPromise = this._doConnect(chargePointId)
+    this.state.connectionLocks.set(chargePointId, connectionPromise)
+
+    try {
+      const result = await connectionPromise
+      return result
+    } finally {
+      // 清理连接锁
+      this.state.connectionLocks.delete(chargePointId)
+    }
+  }
+
+  // 实际连接实现
+  private async _doConnect(chargePointId: string): Promise<boolean> {
     try {
       // 检查网络状态
       if (this.networkStatus === 'offline') {
         throw new Error('网络连接不可用')
       }
 
-      // 如果已经连接，先断开
-      if (this.state.connections.has(chargePointId)) {
-        this.disconnect(chargePointId)
+      const currentState = this.state.connectionStates.get(chargePointId) || WebSocketState.CLOSED
+
+      // 检查当前状态是否允许连接
+      if (currentState === WebSocketState.CONNECTING) {
+        throw new Error(`充电桩 ${chargePointId} 正在连接中`)
       }
+
+      if (currentState === WebSocketState.OPEN) {
+        console.log(`充电桩 ${chargePointId} 已连接，先断开旧连接`)
+        await this._doDisconnect(chargePointId)
+      }
+
+      if (currentState === WebSocketState.CLOSING) {
+        console.log(`充电桩 ${chargePointId} 正在断开中，等待完成...`)
+        await this._waitForState(chargePointId, WebSocketState.CLOSED, this.config.disconnectTimeout)
+      }
+
+      // 设置连接状态
+      this.state.connectionStates.set(chargePointId, WebSocketState.CONNECTING)
 
       const url = `${this.config.baseUrl}/${chargePointId}`
       console.log(`尝试连接充电桩: ${chargePointId} -> ${url}`)
@@ -113,6 +152,7 @@ export class OCPPWebSocketManager {
       return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
           ws.close()
+          this.state.connectionStates.set(chargePointId, WebSocketState.CLOSED)
           const error = new Error(`连接超时: ${chargePointId} (${this.config.timeout}ms)`)
           this.notifyError(chargePointId, error)
           reject(error)
@@ -159,6 +199,7 @@ export class OCPPWebSocketManager {
       })
     } catch (error) {
       console.error(`连接充电桩 ${chargePointId} 失败:`, error)
+      this.state.connectionStates.set(chargePointId, WebSocketState.CLOSED)
       this.notifyError(chargePointId, error as Error)
       return false
     }
@@ -242,29 +283,93 @@ export class OCPPWebSocketManager {
     }
   }
 
-  // 断开连接
-  disconnect(chargePointId: string) {
-    const ws = this.state.connections.get(chargePointId)
-    if (ws) {
-      this.state.connectionStates.set(chargePointId, WebSocketState.CLOSING)
-      ws.close(1000, 'Normal closure')
-      this.cleanup(chargePointId)
+  // 等待连接状态变化
+  private async _waitForState(chargePointId: string, targetState: WebSocketState, timeout: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const startTime = Date.now()
+
+      const checkState = () => {
+        const currentState = this.state.connectionStates.get(chargePointId)
+
+        if (currentState === targetState) {
+          resolve()
+          return
+        }
+
+        if (Date.now() - startTime > timeout) {
+          reject(new Error(`等待状态 ${targetState} 超时: ${chargePointId}`))
+          return
+        }
+
+        setTimeout(checkState, 100) // 每100ms检查一次
+      }
+
+      checkState()
+    })
+  }
+
+  // 断开连接（优雅断开）
+  async disconnect(chargePointId: string): Promise<void> {
+    // 检查是否已有连接操作在进行
+    const existingLock = this.state.connectionLocks.get(chargePointId)
+    if (existingLock) {
+      console.log(`充电桩 ${chargePointId} 连接操作进行中，等待完成后断开...`)
+      await existingLock.catch(() => {}) // 忽略连接失败
     }
+
+    return this._doDisconnect(chargePointId)
+  }
+
+  // 实际断开实现
+  private async _doDisconnect(chargePointId: string): Promise<void> {
+    const ws = this.state.connections.get(chargePointId)
+    const currentState = this.state.connectionStates.get(chargePointId)
+
+    if (!ws || currentState !== WebSocketState.OPEN) {
+      console.log(`充电桩 ${chargePointId} 未连接，跳过断开操作`)
+      this.cleanup(chargePointId)
+      return
+    }
+
+    this.state.connectionStates.set(chargePointId, WebSocketState.CLOSING)
+
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        console.warn(`充电桩 ${chargePointId} 断开超时，强制清理`)
+        this.cleanup(chargePointId)
+        resolve()
+      }, this.config.disconnectTimeout)
+
+      const originalOnClose = ws.onclose
+      ws.onclose = (event) => {
+        clearTimeout(timeout)
+        console.log(`充电桩 ${chargePointId} 断开完成`)
+        this.cleanup(chargePointId)
+        resolve()
+
+        // 调用原始的onclose处理器（如果存在）
+        if (originalOnClose && typeof originalOnClose === 'function') {
+          originalOnClose.call(ws, event)
+        }
+      }
+
+      ws.close(1000, 'Normal closure')
+    })
   }
 
   // 清理资源
   private cleanup(chargePointId: string) {
     this.state.connections.delete(chargePointId)
     this.state.connectionStates.set(chargePointId, WebSocketState.CLOSED)
-    
+
     const interval = this.state.heartbeatIntervals.get(chargePointId)
     if (interval) {
       clearInterval(interval)
       this.state.heartbeatIntervals.delete(chargePointId)
     }
-    
+
     this.state.messageHandlers.delete(chargePointId)
-    
+
     // 清理待处理的消息
     for (const [messageId, pending] of this.pendingMessages.entries()) {
       if (messageId.startsWith(chargePointId)) {
@@ -602,10 +707,11 @@ export class OCPPWebSocketManager {
   }
 
   // 断开所有连接
-  disconnectAll() {
-    for (const chargePointId of this.state.connections.keys()) {
-      this.disconnect(chargePointId)
-    }
+  async disconnectAll(): Promise<void> {
+    const disconnectPromises = Array.from(this.state.connections.keys())
+      .map(chargePointId => this.disconnect(chargePointId))
+
+    await Promise.allSettled(disconnectPromises)
   }
 
   // 重连所有连接

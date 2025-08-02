@@ -381,163 +381,425 @@ export default function StationDetailPage() {
 
 ## 5. WebSocket通信设计
 
-### 5.1 WebSocket管理器
+### 5.1 连接生命周期管理
+
+#### 5.1.1 连接状态机设计
+
+```
+连接状态转换图:
+IDLE ──connect()──> CONNECTING ──onopen──> CONNECTED
+  ↑                     │                      │
+  │                     │onerror              │
+  │                     ▼                      │
+  └──cleanup()──── DISCONNECTING ◄──disconnect()──┘
+                        │
+                        │onclose
+                        ▼
+                      IDLE
+```
+
+#### 5.1.2 连接状态枚举
+
+````typescript
+enum WebSocketState {
+  IDLE = 'IDLE',           // 空闲状态，可以建立新连接
+  CONNECTING = 'CONNECTING', // 正在建立连接
+  CONNECTED = 'CONNECTED',   // 已连接
+  DISCONNECTING = 'DISCONNECTING' // 正在断开连接
+}
+````
+
+#### 5.1.3 连接管理原则
+
+1. **连接唯一性**: 每个充电桩同时只能有一个WebSocket连接
+2. **状态一致性**: 客户端和服务端连接状态必须保持一致
+3. **优雅断开**: 断开连接时必须等待服务端确认
+4. **重连安全**: 重连前必须确保旧连接完全清理
+5. **并发控制**: 同一充电桩的连接操作必须串行化
+
+### 5.2 WebSocket管理器重新设计
 
 ````typescript path=lib/websocket/OCPPWebSocketManager.ts mode=EDIT
 import { OCPPMessage, ConnectionStatus } from "@/types/charging"
 
-export class OCPPWebSocketManager {
-  private connections: Map<string, WebSocket> = new Map()
-  private heartbeatIntervals: Map<string, NodeJS.Timeout> = new Map()
-  private messageHandlers: Map<string, (message: OCPPMessage) => void> = new Map()
-  
-  constructor(private baseUrl: string = 'ws://localhost:8080/ocpp') {}
+// 连接状态枚举
+enum WebSocketState {
+  IDLE = 'IDLE',
+  CONNECTING = 'CONNECTING',
+  CONNECTED = 'CONNECTED',
+  DISCONNECTING = 'DISCONNECTING'
+}
 
-  // 连接充电桩
+// 连接管理配置
+interface WebSocketManagerConfig {
+  baseUrl: string
+  protocols: string[]
+  heartbeatInterval: number
+  reconnectInterval: number
+  maxReconnectAttempts: number
+  timeout: number
+  disconnectTimeout: number  // 断开连接超时时间
+}
+
+// 连接管理状态
+interface ConnectionManagerState {
+  connections: Map<string, WebSocket>
+  connectionStates: Map<string, WebSocketState>
+  heartbeatIntervals: Map<string, NodeJS.Timeout>
+  messageHandlers: Map<string, (message: OCPPMessage) => void>
+  reconnectAttempts: Map<string, number>
+  connectionLocks: Map<string, Promise<boolean>>  // 连接操作互斥锁
+}
+
+export class OCPPWebSocketManager {
+  private config: WebSocketManagerConfig
+  private state: ConnectionManagerState
+  private messageQueue: Map<string, OCPPMessage[]> = new Map()
+  private pendingMessages: Map<string, { resolve: Function, reject: Function, timeout: NodeJS.Timeout }> = new Map()
+  private errorHandlers: Map<string, (error: Error) => void> = new Map()
+
+  constructor(config?: Partial<WebSocketManagerConfig>) {
+    this.config = {
+      baseUrl: config?.baseUrl || 'ws://localhost:8080/ocpp',
+      protocols: config?.protocols || ['ocpp1.6'],
+      heartbeatInterval: config?.heartbeatInterval || 300000,
+      reconnectInterval: config?.reconnectInterval || 5000,
+      maxReconnectAttempts: config?.maxReconnectAttempts || 5,
+      timeout: config?.timeout || 30000,
+      disconnectTimeout: config?.disconnectTimeout || 10000,
+      ...config
+    }
+
+    this.state = {
+      connections: new Map(),
+      connectionStates: new Map(),
+      heartbeatIntervals: new Map(),
+      messageHandlers: new Map(),
+      reconnectAttempts: new Map(),
+      connectionLocks: new Map()
+    }
+  }
+
+  // 连接充电桩（带互斥锁）
   async connect(chargePointId: string): Promise<boolean> {
+    // 检查是否已有连接操作在进行
+    const existingLock = this.state.connectionLocks.get(chargePointId)
+    if (existingLock) {
+      console.log(`充电桩 ${chargePointId} 连接操作已在进行中，等待完成...`)
+      return existingLock
+    }
+
+    // 创建连接操作锁
+    const connectionPromise = this._doConnect(chargePointId)
+    this.state.connectionLocks.set(chargePointId, connectionPromise)
+
     try {
-      const url = `${this.baseUrl}/${chargePointId}`
-      const ws = new WebSocket(url, ['ocpp1.6'])
-      
+      const result = await connectionPromise
+      return result
+    } finally {
+      // 清理连接锁
+      this.state.connectionLocks.delete(chargePointId)
+    }
+  }
+
+  // 实际连接实现
+  private async _doConnect(chargePointId: string): Promise<boolean> {
+    try {
+      const currentState = this.state.connectionStates.get(chargePointId) || WebSocketState.IDLE
+
+      // 检查当前状态是否允许连接
+      if (currentState === WebSocketState.CONNECTING) {
+        throw new Error(`充电桩 ${chargePointId} 正在连接中`)
+      }
+
+      if (currentState === WebSocketState.CONNECTED) {
+        console.log(`充电桩 ${chargePointId} 已连接，先断开旧连接`)
+        await this._doDisconnect(chargePointId)
+      }
+
+      if (currentState === WebSocketState.DISCONNECTING) {
+        console.log(`充电桩 ${chargePointId} 正在断开中，等待完成...`)
+        await this._waitForState(chargePointId, WebSocketState.IDLE, this.config.disconnectTimeout)
+      }
+
+      // 设置连接状态
+      this.state.connectionStates.set(chargePointId, WebSocketState.CONNECTING)
+
+      const url = `${this.config.baseUrl}/${chargePointId}`
+      console.log(`尝试连接充电桩: ${chargePointId} -> ${url}`)
+
+      const ws = new WebSocket(url, this.config.protocols)
+
       return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          ws.close()
+          this.state.connectionStates.set(chargePointId, WebSocketState.IDLE)
+          const error = new Error(`连接超时: ${chargePointId} (${this.config.timeout}ms)`)
+          this.notifyError(chargePointId, error)
+          reject(error)
+        }, this.config.timeout)
+
         ws.onopen = () => {
+          clearTimeout(timeout)
           console.log(`充电桩 ${chargePointId} 连接成功`)
-          this.connections.set(chargePointId, ws)
+
+          this.state.connections.set(chargePointId, ws)
+          this.state.connectionStates.set(chargePointId, WebSocketState.CONNECTED)
+          this.state.reconnectAttempts.set(chargePointId, 0)
+
+          this.setupEventHandlers(chargePointId, ws)
           this.startHeartbeat(chargePointId)
-          this.sendBootNotification(chargePointId)
+
+          // 发送启动通知
+          this.sendBootNotification(chargePointId).catch(error => {
+            console.error(`发送启动通知失败: ${chargePointId}`, error)
+          })
+
+          // 发送队列中的消息
+          this.flushMessageQueue(chargePointId)
+
           resolve(true)
         }
 
-        ws.onmessage = (event) => {
-          const message: OCPPMessage = JSON.parse(event.data)
-          this.handleMessage(chargePointId, message)
-        }
-
         ws.onerror = (error) => {
-          console.error(`充电桩 ${chargePointId} 连接错误:`, error)
-          reject(error)
+          clearTimeout(timeout)
+          const errorMsg = `充电桩 ${chargePointId} 连接错误`
+          console.error(errorMsg, error)
+          this.state.connectionStates.set(chargePointId, WebSocketState.IDLE)
+
+          const connectionError = new Error(errorMsg)
+          this.notifyError(chargePointId, connectionError)
+          reject(connectionError)
         }
 
-        ws.onclose = () => {
-          console.log(`充电桩 ${chargePointId} 连接关闭`)
-          this.cleanup(chargePointId)
+        ws.onclose = (event) => {
+          clearTimeout(timeout)
+          console.log(`充电桩 ${chargePointId} 连接关闭: code=${event.code}, reason=${event.reason}`)
+          this.handleConnectionClose(chargePointId, event)
         }
       })
     } catch (error) {
       console.error(`连接充电桩 ${chargePointId} 失败:`, error)
+      this.state.connectionStates.set(chargePointId, WebSocketState.IDLE)
+      this.notifyError(chargePointId, error as Error)
       return false
     }
   }
 
-  // 断开连接
-  disconnect(chargePointId: string) {
-    const ws = this.connections.get(chargePointId)
-    if (ws) {
-      ws.close()
+  // 断开连接（优雅断开）
+  async disconnect(chargePointId: string): Promise<void> {
+    // 检查是否已有连接操作在进行
+    const existingLock = this.state.connectionLocks.get(chargePointId)
+    if (existingLock) {
+      console.log(`充电桩 ${chargePointId} 连接操作进行中，等待完成后断开...`)
+      await existingLock.catch(() => {}) // 忽略连接失败
+    }
+
+    return this._doDisconnect(chargePointId)
+  }
+
+  // 实际断开实现
+  private async _doDisconnect(chargePointId: string): Promise<void> {
+    const ws = this.state.connections.get(chargePointId)
+    const currentState = this.state.connectionStates.get(chargePointId)
+
+    if (!ws || currentState !== WebSocketState.CONNECTED) {
+      console.log(`充电桩 ${chargePointId} 未连接，跳过断开操作`)
       this.cleanup(chargePointId)
+      return
+    }
+
+    this.state.connectionStates.set(chargePointId, WebSocketState.DISCONNECTING)
+
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        console.warn(`充电桩 ${chargePointId} 断开超时，强制清理`)
+        this.cleanup(chargePointId)
+        resolve()
+      }, this.config.disconnectTimeout)
+
+      const originalOnClose = ws.onclose
+      ws.onclose = (event) => {
+        clearTimeout(timeout)
+        console.log(`充电桩 ${chargePointId} 断开完成`)
+        this.cleanup(chargePointId)
+        resolve()
+
+        // 调用原始的onclose处理器（如果存在）
+        if (originalOnClose && typeof originalOnClose === 'function') {
+          originalOnClose.call(ws, event)
+        }
+      }
+
+      ws.close(1000, 'Normal closure')
+    })
+  }
+
+  // 等待连接状态变化
+  private async _waitForState(chargePointId: string, targetState: WebSocketState, timeout: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const startTime = Date.now()
+
+      const checkState = () => {
+        const currentState = this.state.connectionStates.get(chargePointId)
+
+        if (currentState === targetState) {
+          resolve()
+          return
+        }
+
+        if (Date.now() - startTime > timeout) {
+          reject(new Error(`等待状态 ${targetState} 超时: ${chargePointId}`))
+          return
+        }
+
+        setTimeout(checkState, 100) // 每100ms检查一次
+      }
+
+      checkState()
+    })
+  }
+
+  // 设置事件处理器
+  private setupEventHandlers(chargePointId: string, ws: WebSocket) {
+    ws.onmessage = (event) => {
+      try {
+        const message: OCPPMessage = JSON.parse(event.data)
+        this.handleMessage(chargePointId, message)
+      } catch (error) {
+        console.error(`解析消息失败 ${chargePointId}:`, error, event.data)
+      }
     }
   }
 
-  // 发送启动通知
-  private sendBootNotification(chargePointId: string) {
-    const message: OCPPMessage = [
-      2,
-      this.generateMessageId(),
-      "BootNotification",
-      {
-        chargePointVendor: "SimulatorVendor",
-        chargePointModel: "SimulatorModel",
-        chargePointSerialNumber: chargePointId,
-        firmwareVersion: "1.0.0"
-      }
-    ]
-    this.sendMessage(chargePointId, message)
-  }
+  // 处理连接关闭
+  private handleConnectionClose(chargePointId: string, event: CloseEvent) {
+    this.cleanup(chargePointId)
 
-  // 发送心跳
-  private sendHeartbeat(chargePointId: string) {
-    const message: OCPPMessage = [
-      2,
-      this.generateMessageId(),
-      "Heartbeat",
-      {}
-    ]
-    this.sendMessage(chargePointId, message)
-  }
-
-  // 发送状态通知
-  sendStatusNotification(chargePointId: string, connectorId: number, status: string, errorCode: string = "NoError") {
-    const message: OCPPMessage = [
-      2,
-      this.generateMessageId(),
-      "StatusNotification",
-      {
-        connectorId,
-        errorCode,
-        status,
-        timestamp: new Date().toISOString(),
-        info: `Connector ${connectorId} status: ${status}`
-      }
-    ]
-    this.sendMessage(chargePointId, message)
-  }
-
-  // 发送开始交易
-  sendStartTransaction(chargePointId: string, connectorId: number, idTag: string) {
-    const message: OCPPMessage = [
-      2,
-      this.generateMessageId(),
-      "StartTransaction",
-      {
-        connectorId,
-        idTag,
-        meterStart: 0,
-        timestamp: new Date().toISOString()
-      }
-    ]
-    this.sendMessage(chargePointId, message)
-  }
-
-  // 发送电表数据
-  sendMeterValues(chargePointId: string, connectorId: number, transactionId: number, values: any) {
-    const message: OCPPMessage = [
-      2,
-      this.generateMessageId(),
-      "MeterValues",
-      {
-        connectorId,
-        transactionId,
-        meterValue: [{
-          timestamp: new Date().toISOString(),
-          sampledValue: values
-        }]
-      }
-    ]
-    this.sendMessage(chargePointId, message)
-  }
-
-  // 发送停止交易
-  sendStopTransaction(chargePointId: string, transactionId: number, meterStop: number, reason: string = "Local") {
-    const message: OCPPMessage = [
-      2,
-      this.generateMessageId(),
-      "StopTransaction",
-      {
-        transactionId,
-        meterStop,
-        timestamp: new Date().toISOString(),
-        reason
-      }
-    ]
-    this.sendMessage(chargePointId, message)
-  }
-
-  // 发送消息
-  private sendMessage(chargePointId: string, message: OCPPMessage) {
-    const ws = this.connections.get(chargePointId)
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(message))
+    // 如果不是主动关闭，尝试重连
+    if (event.code !== 1000) { // 1000 = 正常关闭
+      this.attemptReconnect(chargePointId)
     }
+  }
+
+  // 清理资源
+  private cleanup(chargePointId: string) {
+    this.state.connections.delete(chargePointId)
+    this.state.connectionStates.set(chargePointId, WebSocketState.IDLE)
+
+    const interval = this.state.heartbeatIntervals.get(chargePointId)
+    if (interval) {
+      clearInterval(interval)
+      this.state.heartbeatIntervals.delete(chargePointId)
+    }
+
+    this.state.messageHandlers.delete(chargePointId)
+
+    // 清理待处理的消息
+    for (const [messageId, pending] of this.pendingMessages.entries()) {
+      if (messageId.startsWith(chargePointId)) {
+        clearTimeout(pending.timeout)
+        pending.reject(new Error('连接已断开'))
+        this.pendingMessages.delete(messageId)
+      }
+    }
+  }
+
+  // 错误通知
+  private notifyError(chargePointId: string, error: Error) {
+    const handler = this.errorHandlers.get(chargePointId)
+    if (handler) {
+      handler(error)
+    }
+  }
+
+  // 尝试重连
+  private async attemptReconnect(chargePointId: string) {
+    const attempts = this.state.reconnectAttempts.get(chargePointId) || 0
+
+    if (attempts < this.config.maxReconnectAttempts) {
+      this.state.reconnectAttempts.set(chargePointId, attempts + 1)
+
+      const delay = this.config.reconnectInterval * Math.pow(2, attempts) // 指数退避
+      console.log(`尝试重连充电桩 ${chargePointId}, 第 ${attempts + 1} 次，延迟 ${delay}ms`)
+
+      setTimeout(async () => {
+        try {
+          await this.connect(chargePointId)
+          console.log(`充电桩 ${chargePointId} 重连成功`)
+        } catch (error) {
+          console.error(`重连失败 ${chargePointId}:`, error)
+          this.notifyError(chargePointId, error as Error)
+        }
+      }, delay)
+    } else {
+      const error = new Error(`充电桩 ${chargePointId} 重连次数已达上限 (${this.config.maxReconnectAttempts})`)
+      console.error(error.message)
+      this.notifyError(chargePointId, error)
+    }
+  }
+
+  // 消息队列管理
+  private queueMessage(chargePointId: string, message: OCPPMessage) {
+    if (!this.messageQueue.has(chargePointId)) {
+      this.messageQueue.set(chargePointId, [])
+    }
+    this.messageQueue.get(chargePointId)!.push(message)
+  }
+
+  private flushMessageQueue(chargePointId: string) {
+    const queue = this.messageQueue.get(chargePointId)
+    if (queue && queue.length > 0) {
+      console.log(`发送队列中的 ${queue.length} 条消息: ${chargePointId}`)
+      queue.forEach(message => {
+        this.sendMessage(chargePointId, message).catch(console.error)
+      })
+      this.messageQueue.delete(chargePointId)
+    }
+  }
+
+  // 发送消息（带重试和队列）
+  private sendMessage(chargePointId: string, message: OCPPMessage): Promise<any> {
+    const ws = this.state.connections.get(chargePointId)
+
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      // 如果连接不可用，将消息加入队列
+      this.queueMessage(chargePointId, message)
+      const error = new Error(`充电桩 ${chargePointId} 连接不可用，消息已加入队列`)
+      console.warn(error.message)
+      return Promise.reject(error)
+    }
+
+    return new Promise((resolve, reject) => {
+      try {
+        const messageData = JSON.stringify(message)
+        ws.send(messageData)
+        console.log(`发送消息到 ${chargePointId}:`, message[0] === 2 ? `${message[2]} (${message[1]})` : `Response (${message[1]})`)
+
+        // 如果是Call消息，等待响应
+        if (message[0] === 2) {
+          const messageId = message[1]
+          const timeout = setTimeout(() => {
+            this.pendingMessages.delete(`${chargePointId}-${messageId}`)
+            const error = new Error(`消息超时: ${chargePointId} - ${message[2]} (${this.config.timeout}ms)`)
+            this.notifyError(chargePointId, error)
+            reject(error)
+          }, this.config.timeout)
+
+          this.pendingMessages.set(`${chargePointId}-${messageId}`, {
+            resolve,
+            reject,
+            timeout
+          })
+        } else {
+          resolve(undefined)
+        }
+      } catch (error) {
+        const sendError = new Error(`发送消息失败: ${chargePointId} - ${(error as Error).message}`)
+        this.notifyError(chargePointId, sendError)
+        reject(sendError)
+      }
+    })
   }
 
   // 处理接收到的消息
@@ -545,15 +807,15 @@ export class OCPPWebSocketManager {
     const [messageType, messageId, actionOrPayload, payload] = message
 
     if (messageType === 2) { // Call
-      this.handleCall(chargePointId, messageId, actionOrPayload, payload)
+      this.handleCall(chargePointId, messageId, actionOrPayload as string, payload)
     } else if (messageType === 3) { // CallResult
       this.handleCallResult(chargePointId, messageId, actionOrPayload)
     } else if (messageType === 4) { // CallError
-      this.handleCallError(chargePointId, messageId, actionOrPayload, payload)
+      this.handleCallError(chargePointId, messageId, actionOrPayload as string, payload)
     }
 
     // 通知外部处理器
-    const handler = this.messageHandlers.get(chargePointId)
+    const handler = this.state.messageHandlers.get(chargePointId)
     if (handler) {
       handler(message)
     }
@@ -562,75 +824,77 @@ export class OCPPWebSocketManager {
   // 处理Call消息
   private handleCall(chargePointId: string, messageId: string, action: string, payload: any) {
     console.log(`收到 ${chargePointId} 的 ${action} 请求:`, payload)
-    
-    // 根据不同的action处理并响应
+
     switch (action) {
       case 'RemoteStartTransaction':
-        this.sendCallResult(chargePointId, messageId, { status: 'Accepted' })
-        // 模拟启动充电
-        setTimeout(() => {
-          this.sendStatusNotification(chargePointId, payload.connectorId, 'Preparing')
-          setTimeout(() => {
-            this.sendStartTransaction(chargePointId, payload.connectorId, payload.idTag)
-          }, 2000)
-        }, 1000)
+        this.handleRemoteStartTransaction(chargePointId, messageId, payload)
         break
-        
+
       case 'RemoteStopTransaction':
-        this.sendCallResult(chargePointId, messageId, { status: 'Accepted' })
-        // 模拟停止充电
-        setTimeout(() => {
-          this.sendStopTransaction(chargePointId, payload.transactionId, 1500)
-          this.sendStatusNotification(chargePointId, 1, 'Available')
-        }, 1000)
+        this.handleRemoteStopTransaction(chargePointId, messageId, payload)
         break
-        
+
       default:
         this.sendCallResult(chargePointId, messageId, {})
     }
   }
 
+  // 处理远程启动充电
+  private handleRemoteStartTransaction(chargePointId: string, messageId: string, payload: any) {
+    const response = { status: 'Accepted' }
+    this.sendCallResult(chargePointId, messageId, response)
+
+    // 模拟启动充电流程
+    setTimeout(() => {
+      this.sendStatusNotification(chargePointId, payload.connectorId || 1, 'Preparing')
+      setTimeout(() => {
+        this.sendStartTransaction(chargePointId, payload.connectorId || 1, payload.idTag)
+      }, 2000)
+    }, 1000)
+  }
+
+  // 处理远程停止充电
+  private handleRemoteStopTransaction(chargePointId: string, messageId: string, payload: any) {
+    const response = { status: 'Accepted' }
+    this.sendCallResult(chargePointId, messageId, response)
+
+    // 模拟停止充电流程
+    setTimeout(() => {
+      this.sendStopTransaction(chargePointId, payload.transactionId, 1500)
+      this.sendStatusNotification(chargePointId, 1, 'Available')
+    }, 1000)
+  }
+
   // 发送CallResult响应
   private sendCallResult(chargePointId: string, messageId: string, payload: any) {
     const message: OCPPMessage = [3, messageId, payload]
-    this.sendMessage(chargePointId, message)
+    this.sendMessage(chargePointId, message).catch(console.error)
   }
 
   // 处理CallResult消息
   private handleCallResult(chargePointId: string, messageId: string, payload: any) {
-    console.log(`收到 ${chargePointId} 的响应:`, payload)
+    const pendingKey = `${chargePointId}-${messageId}`
+    const pending = this.pendingMessages.get(pendingKey)
+
+    if (pending) {
+      clearTimeout(pending.timeout)
+      pending.resolve(payload)
+      this.pendingMessages.delete(pendingKey)
+    }
   }
 
   // 处理CallError消息
   private handleCallError(chargePointId: string, messageId: string, errorCode: string, errorDescription: string) {
     console.error(`收到 ${chargePointId} 的错误:`, errorCode, errorDescription)
-  }
 
-  // 启动心跳
-  private startHeartbeat(chargePointId: string) {
-    const interval = setInterval(() => {
-      this.sendHeartbeat(chargePointId)
-    }, 300000) // 5分钟心跳间隔
-    
-    this.heartbeatIntervals.set(chargePointId, interval)
-  }
+    const pendingKey = `${chargePointId}-${messageId}`
+    const pending = this.pendingMessages.get(pendingKey)
 
-  // 清理资源
-  private cleanup(chargePointId: string) {
-    this.connections.delete(chargePointId)
-    
-    const interval = this.heartbeatIntervals.get(chargePointId)
-    if (interval) {
-      clearInterval(interval)
-      this.heartbeatIntervals.delete(chargePointId)
+    if (pending) {
+      clearTimeout(pending.timeout)
+      pending.reject(new Error(`${errorCode}: ${errorDescription}`))
+      this.pendingMessages.delete(pendingKey)
     }
-    
-    this.messageHandlers.delete(chargePointId)
-  }
-
-  // 注册消息处理器
-  onMessage(chargePointId: string, handler: (message: OCPPMessage) => void) {
-    this.messageHandlers.set(chargePointId, handler)
   }
 
   // 生成消息ID
@@ -640,9 +904,134 @@ export class OCPPWebSocketManager {
     return `sim-${timestamp}-${random}`
   }
 
+  // OCPP消息发送方法
+
+  // 发送启动通知
+  sendBootNotification(chargePointId: string): Promise<any> {
+    const request = {
+      chargePointVendor: "SimulatorVendor",
+      chargePointModel: "SimulatorModel",
+      chargePointSerialNumber: chargePointId,
+      firmwareVersion: "1.0.0"
+    }
+
+    const message: OCPPMessage = [2, this.generateMessageId(), "BootNotification", request]
+    return this.sendMessage(chargePointId, message)
+  }
+
+  // 发送心跳
+  sendHeartbeat(chargePointId: string): Promise<any> {
+    const request = {}
+    const message: OCPPMessage = [2, this.generateMessageId(), "Heartbeat", request]
+    return this.sendMessage(chargePointId, message)
+  }
+
+  // 发送状态通知
+  sendStatusNotification(
+    chargePointId: string,
+    connectorId: number,
+    status: string,
+    errorCode: string = "NoError"
+  ): Promise<any> {
+    const request = {
+      connectorId,
+      errorCode,
+      status,
+      timestamp: new Date().toISOString(),
+      info: `Connector ${connectorId} status: ${status}`
+    }
+
+    const message: OCPPMessage = [2, this.generateMessageId(), "StatusNotification", request]
+    return this.sendMessage(chargePointId, message)
+  }
+
+  // 发送开始交易
+  sendStartTransaction(chargePointId: string, connectorId: number, idTag: string): Promise<any> {
+    const request = {
+      connectorId,
+      idTag,
+      meterStart: 0,
+      timestamp: new Date().toISOString()
+    }
+
+    const message: OCPPMessage = [2, this.generateMessageId(), "StartTransaction", request]
+    return this.sendMessage(chargePointId, message)
+  }
+
+  // 发送电表数据
+  sendMeterValues(
+    chargePointId: string,
+    connectorId: number,
+    transactionId: number,
+    values: any[]
+  ): Promise<any> {
+    const request = {
+      connectorId,
+      transactionId,
+      meterValue: [{
+        timestamp: new Date().toISOString(),
+        sampledValue: values
+      }]
+    }
+
+    const message: OCPPMessage = [2, this.generateMessageId(), "MeterValues", request]
+    return this.sendMessage(chargePointId, message)
+  }
+
+  // 发送停止交易
+  sendStopTransaction(
+    chargePointId: string,
+    transactionId: number,
+    meterStop: number,
+    reason: string = "Local"
+  ): Promise<any> {
+    const request = {
+      transactionId,
+      meterStop,
+      timestamp: new Date().toISOString(),
+      reason
+    }
+
+    const message: OCPPMessage = [2, this.generateMessageId(), "StopTransaction", request]
+    return this.sendMessage(chargePointId, message)
+  }
+
+  // 启动心跳
+  private startHeartbeat(chargePointId: string) {
+    const interval = setInterval(() => {
+      this.sendHeartbeat(chargePointId).catch(error => {
+        console.error(`心跳发送失败 ${chargePointId}:`, error)
+      })
+    }, this.config.heartbeatInterval)
+
+    this.state.heartbeatIntervals.set(chargePointId, interval)
+  }
+
+  // 注册消息处理器
+  onMessage(chargePointId: string, handler: (message: OCPPMessage) => void) {
+    this.state.messageHandlers.set(chargePointId, handler)
+  }
+
+  // 移除消息处理器
+  offMessage(chargePointId: string) {
+    this.state.messageHandlers.delete(chargePointId)
+  }
+
+  // 注册错误处理器
+  onError(chargePointId: string, handler: (error: Error) => void) {
+    this.errorHandlers.set(chargePointId, handler)
+  }
+
+  // 移除错误处理器
+  offError(chargePointId: string) {
+    this.errorHandlers.delete(chargePointId)
+  }
+
   // 获取连接状态
   getConnectionStatus(chargePointId: string): ConnectionStatus {
-    const ws = this.connections.get(chargePointId)
+    const ws = this.state.connections.get(chargePointId)
+    const state = this.state.connectionStates.get(chargePointId) || WebSocketState.IDLE
+
     return {
       chargePointId,
       connected: ws ? ws.readyState === WebSocket.OPEN : false,
@@ -653,9 +1042,36 @@ export class OCPPWebSocketManager {
 
   // 获取所有连接状态
   getAllConnectionStatus(): ConnectionStatus[] {
-    return Array.from(this.connections.keys()).map(chargePointId => 
+    return Array.from(this.state.connections.keys()).map(chargePointId =>
       this.getConnectionStatus(chargePointId)
     )
+  }
+
+  // 检查连接是否活跃
+  isConnected(chargePointId: string): boolean {
+    const ws = this.state.connections.get(chargePointId)
+    return ws ? ws.readyState === WebSocket.OPEN : false
+  }
+
+  // 获取连接数量
+  getConnectionCount(): number {
+    return Array.from(this.state.connections.values())
+      .filter(ws => ws.readyState === WebSocket.OPEN).length
+  }
+
+  // 断开所有连接
+  async disconnectAll(): Promise<void> {
+    const disconnectPromises = Array.from(this.state.connections.keys())
+      .map(chargePointId => this.disconnect(chargePointId))
+
+    await Promise.allSettled(disconnectPromises)
+  }
+
+  // 重连所有连接
+  async reconnectAll(): Promise<void> {
+    const chargePointIds = Array.from(this.state.connections.keys())
+    const promises = chargePointIds.map(id => this.connect(id))
+    await Promise.allSettled(promises)
   }
 }
 
@@ -663,85 +1079,28 @@ export class OCPPWebSocketManager {
 export const ocppWebSocketManager = new OCPPWebSocketManager()
 ````
 
-### 5.2 心跳管理Hook
+### 5.3 心跳管理Hook重新设计
+
+#### 5.3.1 批量连接策略优化
+
+为了避免并发连接导致的重复连接问题，重新设计批量连接策略：
+
+1. **串行连接**: 逐个建立连接，避免并发竞争
+2. **连接去重**: 确保同一充电桩不会重复连接
+3. **进度跟踪**: 提供详细的连接进度信息
+4. **错误分类**: 区分不同类型的连接错误
 
 ````typescript path=hooks/useHeartbeatManager.ts mode=EDIT
 import { useCallback, useEffect, useState } from "react"
 import { ocppWebSocketManager } from "@/lib/websocket/OCPPWebSocketManager"
 import { getStations, getStationChargePoints } from "@/lib/api/stations"
 import { ConnectionStatus } from "@/types/charging"
+import { toast } from "react-hot-toast"
 
 export function useHeartbeatManager() {
   const [connectionStatuses, setConnectionStatuses] = useState<ConnectionStatus[]>([])
   const [isInitializing, setIsInitializing] = useState(false)
-
-  // 启动所有充电枪的心跳
-  const startAllHeartbeats = useCallback(async () => {
-    setIsInitializing(true)
-    try {
-      // 1. 获取所有充电站
-      const stationsResponse = await getStations({ page: 0, size: 100 })
-      const stations = stationsResponse.data.content
-
-      // 2. 获取所有充电桩
-      const allChargePoints = []
-      for (const station of stations) {
-        const chargePointsResponse = await getStationChargePoints(station.stationId)
-        allChargePoints.push(...chargePointsResponse.data)
-      }
-
-      // 3. 为每个充电桩建立连接
-      const connectionPromises = allChargePoints.map(async (chargePoint) => {
-        try {
-          await ocppWebSocketManager.connect(chargePoint.chargePointId)
-          // 发送初始状态通知
-          ocppWebSocketManager.sendStatusNotification(
-            chargePoint.chargePointId, 
-            1, 
-            'Available'
-          )
-          return chargePoint.chargePointId
-        } catch (error) {
-          console.error(`连接充电桩 ${chargePoint.chargePointId} 失败:`, error)
-          return null
-        }
-      })
-
-      const results = await Promise.allSettled(connectionPromises)
-      const successCount = results.filter(result => 
-        result.status === 'fulfilled' && result.value !== null
-      ).length
-
-      console.log(`成功连接 ${successCount}/${allChargePoints.length} 个充电桩`)
-      
-      // 更新连接状态
-      updateConnectionStatuses()
-      
-    } catch (error) {
-      console.error('启动心跳失败:', error)
-    } finally {
-      setIsInitializing(false)
-    }
-  }, [])
-
-  // 启动单个充电桩心跳
-  const startChargerHeartbeat = useCallback(async (chargePointId: string) => {
-    try {
-      await ocppWebSocketManager.connect(chargePointId)
-      ocppWebSocketManager.sendStatusNotification(chargePointId, 1, 'Available')
-      updateConnectionStatuses()
-      return true
-    } catch (error) {
-      console.error(`启动充电桩 ${chargePointId} 心跳失败:`, error)
-      return false
-    }
-  }, [])
-
-  // 停止单个充电桩心跳
-  const stopChargerHeartbeat = useCallback((chargePointId: string) => {
-    ocppWebSocketManager.disconnect(chargePointId)
-    updateConnectionStatuses()
-  }, [])
+  const [initializationProgress, setInitializationProgress] = useState(0)
 
   // 更新连接状态
   const updateConnectionStatuses = useCallback(() => {
@@ -749,19 +1108,326 @@ export function useHeartbeatManager() {
     setConnectionStatuses(statuses)
   }, [])
 
+  // 启动所有充电枪的心跳（串行连接策略）
+  const startAllHeartbeats = useCallback(async () => {
+    setIsInitializing(true)
+    setInitializationProgress(0)
+
+    try {
+      console.log('开始初始化所有充电桩连接...')
+
+      // 1. 获取所有充电站
+      const stationsResponse = await getStations({ page: 0, size: 100 })
+      const stations = stationsResponse.data.content
+      console.log(`获取到 ${stations.length} 个充电站`)
+
+      // 2. 获取所有充电桩
+      const allChargePoints = []
+      for (let i = 0; i < stations.length; i++) {
+        const station = stations[i]
+        try {
+          const chargePointsResponse = await getStationChargePoints(station.stationId)
+          allChargePoints.push(...chargePointsResponse.data)
+          setInitializationProgress(((i + 1) / stations.length) * 30) // 前30%进度用于获取数据
+        } catch (error) {
+          console.error(`获取充电站 ${station.stationId} 的充电桩失败:`, error)
+        }
+      }
+
+      console.log(`获取到 ${allChargePoints.length} 个充电桩`)
+
+      // 3. 去重充电桩ID
+      const uniqueChargePoints = Array.from(
+        new Map(allChargePoints.map(cp => [cp.chargePointId, cp])).values()
+      )
+
+      if (uniqueChargePoints.length !== allChargePoints.length) {
+        console.warn(`发现重复充电桩ID，去重后: ${uniqueChargePoints.length}/${allChargePoints.length}`)
+      }
+
+      // 4. 串行建立连接（避免并发竞争）
+      let successCount = 0
+      let networkErrors = 0
+      let timeoutErrors = 0
+      let duplicateErrors = 0
+      let otherErrors = 0
+
+      for (let i = 0; i < uniqueChargePoints.length; i++) {
+        const chargePoint = uniqueChargePoints[i]
+
+        try {
+          // 设置错误处理器
+          ocppWebSocketManager.onError(chargePoint.chargePointId, (error) => {
+            console.error(`充电桩 ${chargePoint.chargePointId} 错误:`, error)
+
+            // 错误分类统计
+            if (error.message.includes('网络') || error.message.includes('offline')) {
+              networkErrors++
+            } else if (error.message.includes('超时') || error.message.includes('timeout')) {
+              timeoutErrors++
+            } else if (error.message.includes('already exists') || error.message.includes('重复')) {
+              duplicateErrors++
+            } else {
+              otherErrors++
+            }
+          })
+
+          // 建立连接
+          await ocppWebSocketManager.connect(chargePoint.chargePointId)
+
+          // 发送初始状态通知
+          await ocppWebSocketManager.sendStatusNotification(
+            chargePoint.chargePointId,
+            1,
+            'Available'
+          )
+
+          successCount++
+
+          // 更新进度
+          setInitializationProgress(30 + ((i + 1) / uniqueChargePoints.length) * 70)
+
+          // 短暂延迟，避免过快的连接请求
+          if (i < uniqueChargePoints.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 100))
+          }
+
+        } catch (error) {
+          console.error(`连接充电桩 ${chargePoint.chargePointId} 失败:`, error)
+
+          // 错误分类
+          const errorMessage = (error as Error).message
+          if (errorMessage.includes('网络') || errorMessage.includes('offline')) {
+            networkErrors++
+          } else if (errorMessage.includes('超时') || errorMessage.includes('timeout')) {
+            timeoutErrors++
+          } else if (errorMessage.includes('already exists') || errorMessage.includes('重复')) {
+            duplicateErrors++
+          } else {
+            otherErrors++
+          }
+        }
+      }
+
+      console.log(`连接完成: 成功 ${successCount}/${uniqueChargePoints.length}`)
+      console.log(`错误统计: 网络错误 ${networkErrors}, 超时错误 ${timeoutErrors}, 重复连接 ${duplicateErrors}, 其他错误 ${otherErrors}`)
+
+      // 显示详细的成功/失败提示
+      if (successCount === uniqueChargePoints.length) {
+        toast.success(`所有 ${successCount} 个充电桩连接成功`)
+      } else if (successCount > 0) {
+        toast.success(`成功连接 ${successCount}/${uniqueChargePoints.length} 个充电桩`)
+
+        // 显示失败原因统计
+        if (duplicateErrors > 0) {
+          toast.error(`${duplicateErrors} 个充电桩重复连接被拒绝`)
+        }
+        if (networkErrors > 0) {
+          toast.error(`${networkErrors} 个充电桩网络连接失败`)
+        }
+        if (timeoutErrors > 0) {
+          toast.error(`${timeoutErrors} 个充电桩连接超时`)
+        }
+        if (otherErrors > 0) {
+          toast.error(`${otherErrors} 个充电桩连接失败`)
+        }
+      } else {
+        if (duplicateErrors === uniqueChargePoints.length) {
+          toast.error('所有充电桩连接失败：重复连接被拒绝，请检查是否有其他实例在运行')
+        } else if (networkErrors === uniqueChargePoints.length) {
+          toast.error('所有充电桩连接失败：网络连接问题')
+        } else if (timeoutErrors === uniqueChargePoints.length) {
+          toast.error('所有充电桩连接失败：连接超时')
+        } else {
+          toast.error('所有充电桩连接失败，请检查网络和服务器状态')
+        }
+      }
+
+      // 更新连接状态
+      updateConnectionStatuses()
+
+    } catch (error) {
+      console.error('启动心跳失败:', error)
+      toast.error('初始化充电桩连接失败')
+    } finally {
+      setIsInitializing(false)
+      setInitializationProgress(100)
+    }
+  }, [updateConnectionStatuses])
+
+  // 启动单个充电桩心跳
+  const startChargerHeartbeat = useCallback(async (chargePointId: string) => {
+    try {
+      // 设置错误处理器
+      ocppWebSocketManager.onError(chargePointId, (error) => {
+        console.error(`充电桩 ${chargePointId} 错误:`, error)
+        if (error.message.includes('网络')) {
+          toast.error(`网络连接问题: ${chargePointId}`)
+        } else if (error.message.includes('超时')) {
+          toast.error(`连接超时: ${chargePointId}`)
+        } else if (error.message.includes('already exists')) {
+          toast.error(`${chargePointId} 重复连接被拒绝`)
+        } else if (error.message.includes('重连次数已达上限')) {
+          toast.error(`${chargePointId} 连接失败，请检查网络`)
+        }
+      })
+
+      await ocppWebSocketManager.connect(chargePointId)
+      await ocppWebSocketManager.sendStatusNotification(chargePointId, 1, 'Available')
+      updateConnectionStatuses()
+      toast.success(`充电桩 ${chargePointId} 已上线`)
+      return true
+    } catch (error) {
+      console.error(`启动充电桩 ${chargePointId} 心跳失败:`, error)
+      const errorMessage = (error as Error).message
+      if (errorMessage.includes('网络离线')) {
+        toast.error('网络连接不可用，请检查网络设置')
+      } else if (errorMessage.includes('连接超时')) {
+        toast.error(`充电桩 ${chargePointId} 连接超时，请稍后重试`)
+      } else if (errorMessage.includes('already exists')) {
+        toast.error(`充电桩 ${chargePointId} 重复连接被拒绝，请检查是否有其他实例在运行`)
+      } else {
+        toast.error(`充电桩 ${chargePointId} 上线失败: ${errorMessage}`)
+      }
+      return false
+    }
+  }, [updateConnectionStatuses])
+
+  // 停止单个充电桩心跳
+  const stopChargerHeartbeat = useCallback(async (chargePointId: string) => {
+    try {
+      // 移除错误处理器
+      ocppWebSocketManager.offError(chargePointId)
+      await ocppWebSocketManager.disconnect(chargePointId)
+      updateConnectionStatuses()
+      toast.success(`充电桩 ${chargePointId} 已离线`)
+    } catch (error) {
+      console.error(`停止充电桩 ${chargePointId} 心跳失败:`, error)
+      toast.error(`充电桩 ${chargePointId} 离线失败: ${(error as Error).message}`)
+    }
+  }, [updateConnectionStatuses])
+
+  // 批量启动充电桩
+  const startMultipleChargers = useCallback(async (chargePointIds: string[]) => {
+    const promises = chargePointIds.map(id => startChargerHeartbeat(id))
+    const results = await Promise.allSettled(promises)
+
+    const successCount = results.filter(result =>
+      result.status === 'fulfilled' && result.value === true
+    ).length
+
+    if (successCount === chargePointIds.length) {
+      toast.success(`成功启动 ${successCount} 个充电桩`)
+    } else {
+      toast.error(`${chargePointIds.length - successCount} 个充电桩启动失败`)
+    }
+
+    return successCount
+  }, [startChargerHeartbeat])
+
+  // 批量停止充电桩
+  const stopMultipleChargers = useCallback(async (chargePointIds: string[]) => {
+    const promises = chargePointIds.map(id => stopChargerHeartbeat(id))
+    await Promise.allSettled(promises)
+    toast.success(`已停止 ${chargePointIds.length} 个充电桩`)
+  }, [stopChargerHeartbeat])
+
+  // 停止所有充电桩
+  const stopAllHeartbeats = useCallback(async () => {
+    try {
+      await ocppWebSocketManager.disconnectAll()
+      updateConnectionStatuses()
+      toast.success('所有充电桩已离线')
+    } catch (error) {
+      console.error('停止所有心跳失败:', error)
+      toast.error('停止所有充电桩失败')
+    }
+  }, [updateConnectionStatuses])
+
+  // 重连所有充电桩
+  const reconnectAllHeartbeats = useCallback(async () => {
+    try {
+      await ocppWebSocketManager.reconnectAll()
+      updateConnectionStatuses()
+      toast.success('所有充电桩重连完成')
+    } catch (error) {
+      console.error('重连所有充电桩失败:', error)
+      toast.error('重连所有充电桩失败')
+    }
+  }, [updateConnectionStatuses])
+
+  // 获取连接统计信息
+  const getConnectionStats = useCallback(() => {
+    const total = connectionStatuses.length
+    const connected = connectionStatuses.filter(status => status.connected).length
+    const disconnected = total - connected
+
+    return {
+      total,
+      connected,
+      disconnected,
+      connectionRate: total > 0 ? (connected / total) * 100 : 0
+    }
+  }, [connectionStatuses])
+
+  // 检查特定充电桩是否在线
+  const isChargerOnline = useCallback((chargePointId: string) => {
+    return ocppWebSocketManager.isConnected(chargePointId)
+  }, [])
+
+  // 获取在线充电桩列表
+  const getOnlineChargers = useCallback(() => {
+    return connectionStatuses
+      .filter(status => status.connected)
+      .map(status => status.chargePointId)
+  }, [connectionStatuses])
+
+  // 获取离线充电桩列表
+  const getOfflineChargers = useCallback(() => {
+    return connectionStatuses
+      .filter(status => !status.connected)
+      .map(status => status.chargePointId)
+  }, [connectionStatuses])
+
   // 定期更新连接状态
   useEffect(() => {
     const interval = setInterval(updateConnectionStatuses, 10000) // 每10秒更新一次
     return () => clearInterval(interval)
   }, [updateConnectionStatuses])
 
+  // 监听页面可见性变化，页面重新可见时更新状态
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (!document.hidden) {
+        updateConnectionStatuses()
+      }
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
+  }, [updateConnectionStatuses])
+
   return {
+    // 状态
     connectionStatuses,
     isInitializing,
+    initializationProgress,
+
+    // 操作方法
     startAllHeartbeats,
     startChargerHeartbeat,
     stopChargerHeartbeat,
-    updateConnectionStatuses
+    startMultipleChargers,
+    stopMultipleChargers,
+    stopAllHeartbeats,
+    reconnectAllHeartbeats,
+    updateConnectionStatuses,
+
+    // 查询方法
+    getConnectionStats,
+    isChargerOnline,
+    getOnlineChargers,
+    getOfflineChargers,
   }
 }
 ````
@@ -1094,25 +1760,54 @@ export const useChargingStore = create<ChargingState>((set, get) => ({
 
 ### 8.2 技术要点
 
-1. **WebSocket连接管理**
-   - 自动重连机制
-   - 连接状态监控
-   - 消息队列处理
+1. **WebSocket连接生命周期管理**
+   - **连接状态机**: IDLE → CONNECTING → CONNECTED → DISCONNECTING → IDLE
+   - **连接互斥锁**: 防止同一充电桩的并发连接操作
+   - **优雅断开**: 等待服务端确认断开后再允许新连接
+   - **连接去重**: 确保同一充电桩只有一个活跃连接
+   - **状态一致性**: 客户端和服务端连接状态保持同步
 
-2. **OCPP协议实现**
-   - 严格按照OCPP1.6规范
-   - 消息ID管理
-   - 错误处理机制
+2. **批量连接策略优化**
+   - **串行连接**: 逐个建立连接，避免并发竞争
+   - **进度跟踪**: 提供详细的连接进度和错误统计
+   - **错误分类**: 区分网络错误、超时错误、重复连接等
+   - **连接延迟**: 连接间适当延迟，减少服务器压力
 
-3. **状态同步**
-   - 前端状态与后端状态保持一致
-   - 实时数据更新
-   - 离线状态处理
+3. **重连机制改进**
+   - **指数退避**: 重连间隔逐渐增加，避免频繁重试
+   - **网络状态感知**: 监听网络状态变化，智能重连
+   - **重连限制**: 设置最大重连次数，避免无限重试
+   - **状态验证**: 重连前验证连接状态，确保清理完成
 
-4. **用户体验**
-   - 加载状态提示
-   - 错误信息展示
-   - 操作反馈
+4. **OCPP协议实现**
+   - **严格按照OCPP1.6规范**: 消息格式、状态转换严格遵循标准
+   - **消息ID管理**: 唯一消息ID生成和响应匹配
+   - **消息队列**: 连接不可用时消息入队，连接恢复后批量发送
+   - **超时处理**: 消息发送超时检测和错误处理
+
+5. **错误处理和监控**
+   - **分层错误处理**: WebSocket层、OCPP层、应用层分别处理
+   - **错误分类统计**: 统计不同类型错误的发生频率
+   - **实时监控**: 连接状态、心跳状态、错误率实时监控
+   - **用户友好提示**: 根据错误类型提供具体的解决建议
+
+6. **状态同步和数据一致性**
+   - **实时状态更新**: 连接状态、充电状态实时同步
+   - **状态缓存**: 本地缓存连接状态，减少查询开销
+   - **数据校验**: 关键状态变更时进行数据校验
+   - **离线处理**: 网络断开时的状态保持和恢复
+
+7. **性能优化**
+   - **连接池管理**: 合理管理WebSocket连接资源
+   - **内存管理**: 及时清理断开连接的相关资源
+   - **事件节流**: 高频事件（如状态更新）进行节流处理
+   - **批量操作**: 批量连接、批量断开等操作优化
+
+8. **用户体验优化**
+   - **加载状态**: 详细的初始化进度显示
+   - **错误反馈**: 清晰的错误信息和解决建议
+   - **操作确认**: 重要操作的确认和反馈
+   - **状态指示**: 直观的连接状态和统计信息显示
 
 ### 8.3 测试计划
 

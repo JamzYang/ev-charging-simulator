@@ -22,14 +22,16 @@ import { ChargePoint } from "@/types/charging"
 import { toast } from "react-hot-toast"
 
 // 充电桩控制卡片
-function ChargerControlCard({ 
-  chargePoint, 
-  isOnline, 
-  onToggle 
-}: { 
+function ChargerControlCard({
+  chargePoint,
+  isOnline,
+  onToggle,
+  statusLoading = false
+}: {
   chargePoint: ChargePoint
   isOnline: boolean
   onToggle: (online: boolean) => void
+  statusLoading?: boolean
 }) {
   const [loading, setLoading] = useState(false)
 
@@ -60,11 +62,13 @@ function ChargerControlCard({
             </p>
             <div className="flex items-center gap-2 mt-1">
               <span className={`text-xs px-2 py-1 rounded-full ${
-                isOnline 
-                  ? 'bg-green-100 text-green-700' 
-                  : 'bg-gray-100 text-gray-600'
+                statusLoading
+                  ? 'bg-blue-100 text-blue-700'
+                  : isOnline
+                    ? 'bg-green-100 text-green-700'
+                    : 'bg-gray-100 text-gray-600'
               }`}>
-                {isOnline ? '在线' : '离线'}
+                {statusLoading ? '检查中...' : (isOnline ? '在线' : '离线')}
               </span>
               <span className="text-xs text-gray-500">
                 {chargePoint.connectors.length} 个连接器
@@ -76,7 +80,7 @@ function ChargerControlCard({
         <Switch
           checked={isOnline}
           onCheckedChange={handleToggle}
-          disabled={loading}
+          disabled={loading || statusLoading}
         />
       </div>
     </div>
@@ -87,6 +91,7 @@ export default function SettingsPage() {
   const router = useRouter()
   const [chargePoints, setChargePoints] = useState<ChargePoint[]>([])
   const [loading, setLoading] = useState(true)
+  const [statusLoading, setStatusLoading] = useState(true)
 
   const {
     connectionStatuses,
@@ -96,7 +101,8 @@ export default function SettingsPage() {
     startAllHeartbeats,
     stopAllHeartbeats,
     getConnectionStats,
-    updateConnectionStatuses
+    updateConnectionStatuses,
+    isChargerOnline: checkChargerOnline
   } = useHeartbeatManager()
 
   useEffect(() => {
@@ -105,6 +111,9 @@ export default function SettingsPage() {
         setLoading(true)
         const response = await getAllChargePoints({ page: 0, size: 100 })
         setChargePoints(response.data.content)
+
+        // 页面加载完成后立即更新连接状态
+        updateConnectionStatuses()
       } catch (error) {
         console.error('加载充电桩列表失败:', error)
         toast.error('加载充电桩列表失败')
@@ -114,7 +123,35 @@ export default function SettingsPage() {
     }
 
     loadChargePoints()
-  }, [])
+  }, [updateConnectionStatuses])
+
+  // 页面可见时更新连接状态
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (!document.hidden) {
+        console.log('设置页面重新可见，更新连接状态')
+        setStatusLoading(true)
+        updateConnectionStatuses()
+        // 给一点时间让状态更新
+        setTimeout(() => setStatusLoading(false), 500)
+      }
+    }
+
+    // 页面加载时立即更新一次
+    setStatusLoading(true)
+    updateConnectionStatuses()
+    setTimeout(() => setStatusLoading(false), 1000)
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
+  }, [updateConnectionStatuses])
+
+  // 监听connectionStatuses变化，状态更新完成后取消加载状态
+  useEffect(() => {
+    if (connectionStatuses.length > 0) {
+      setStatusLoading(false)
+    }
+  }, [connectionStatuses])
 
   const handleChargerToggle = async (chargePointId: string, online: boolean) => {
     if (online) {
@@ -123,7 +160,7 @@ export default function SettingsPage() {
         throw new Error('启动失败')
       }
     } else {
-      stopChargerHeartbeat(chargePointId)
+      await stopChargerHeartbeat(chargePointId)
     }
   }
 
@@ -136,10 +173,20 @@ export default function SettingsPage() {
   }
 
   const connectionStats = getConnectionStats()
+
+  // 检查充电桩是否在线（更健壮的实现）
   const isChargerOnline = (chargePointId: string) => {
-    return connectionStatuses.some(status => 
-      status.chargePointId === chargePointId && status.connected
+    // 首先检查connectionStatuses数组
+    const statusFromArray = connectionStatuses.find(status =>
+      status.chargePointId === chargePointId
     )
+
+    if (statusFromArray) {
+      return statusFromArray.connected
+    }
+
+    // 如果connectionStatuses还没有数据，使用hook提供的方法
+    return checkChargerOnline(chargePointId)
   }
 
   return (
@@ -249,6 +296,7 @@ export default function SettingsPage() {
                 chargePoint={chargePoint}
                 isOnline={isChargerOnline(chargePoint.chargePointId)}
                 onToggle={(online) => handleChargerToggle(chargePoint.chargePointId, online)}
+                statusLoading={statusLoading}
               />
             ))}
           </div>
@@ -271,6 +319,16 @@ export default function SettingsPage() {
             <p>API URL: {process.env.NEXT_PUBLIC_API_BASE_URL}</p>
             <p>心跳间隔: {process.env.NEXT_PUBLIC_HEARTBEAT_INTERVAL}ms</p>
             <p>调试模式: {process.env.NEXT_PUBLIC_DEBUG_MODE}</p>
+            <p>连接状态数量: {connectionStatuses.length}</p>
+            <p>状态加载中: {statusLoading ? '是' : '否'}</p>
+            {process.env.NEXT_PUBLIC_DEBUG_MODE === 'true' && (
+              <details className="mt-2">
+                <summary className="cursor-pointer text-blue-600">连接状态详情</summary>
+                <pre className="mt-2 text-xs bg-white p-2 rounded border overflow-auto max-h-32">
+                  {JSON.stringify(connectionStatuses, null, 2)}
+                </pre>
+              </details>
+            )}
           </div>
         </div>
       </div>

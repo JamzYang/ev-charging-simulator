@@ -162,6 +162,7 @@ export interface WebSocketManagerConfig {
   reconnectInterval: number
   maxReconnectAttempts: number
   timeout: number
+  disconnectTimeout: number  // 断开连接超时时间
 }
 
 // 连接管理器状态
@@ -171,4 +172,5 @@ export interface ConnectionManagerState {
   heartbeatIntervals: Map<string, NodeJS.Timeout>
   messageHandlers: Map<string, (message: OCPPMessage) => void>
   reconnectAttempts: Map<string, number>
+  connectionLocks: Map<string, Promise<boolean>>  // 连接操作互斥锁
 }
