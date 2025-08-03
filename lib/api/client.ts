@@ -1,6 +1,6 @@
 import { ApiResponse, ApiError, HttpStatusCode } from "@/types/api"
 
-const BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8083/api/v1'
+const BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || '/api/v1'
 const DEFAULT_TIMEOUT = 10000 // 10秒超时
 const MAX_RETRY_ATTEMPTS = 3
 const RETRY_DELAY = 1000 // 1秒重试延迟
